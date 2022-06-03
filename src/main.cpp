@@ -109,7 +109,6 @@ static void print_usage()
     fprintf(stdout, "  -s scale             upscale ratio (1/2/4/8/16/32, default=2)\n");
     fprintf(stdout, "  -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu\n");
     fprintf(stdout, "  -m model-path        waifu2x model path (default=models-cunet)\n");
-    fprintf(stdout, "  -g gpu-id            gpu device to use (-1=cpu, default=auto) can be 0,1,2 for multi-gpu\n");
     fprintf(stdout, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stdout, "  -x                   enable tta mode\n");
     fprintf(stdout, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
@@ -469,11 +468,8 @@ int main(int argc, char** argv)
     path_t outputpath;
     int noise = 0;
     int scale = 2;
-    std::vector<int> tilesize;
     path_t model = PATHSTR("models-cunet");
-    std::vector<int> gpuid;
     int jobs_load = 1;
-    std::vector<int> jobs_proc;
     int jobs_save = 2;
     int verbose = 0;
     int tta_mode = 0;
@@ -498,18 +494,8 @@ int main(int argc, char** argv)
         case L's':
             scale = _wtoi(optarg);
             break;
-        case L't':
-            tilesize = parse_optarg_int_array(optarg);
-            break;
         case L'm':
             model = optarg;
-            break;
-        case L'g':
-            gpuid = parse_optarg_int_array(optarg);
-            break;
-        case L'j':
-            swscanf(optarg, L"%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
             break;
         case L'f':
             format = optarg;
@@ -544,18 +530,8 @@ int main(int argc, char** argv)
         case 's':
             scale = atoi(optarg);
             break;
-        case 't':
-            tilesize = parse_optarg_int_array(optarg);
-            break;
         case 'm':
             model = optarg;
-            break;
-        case 'g':
-            gpuid = parse_optarg_int_array(optarg);
-            break;
-        case 'j':
-            sscanf(optarg, "%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
             break;
         case 'f':
             format = optarg;
@@ -592,40 +568,10 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    if (tilesize.size() != (gpuid.empty() ? 1 : gpuid.size()) && !tilesize.empty())
-    {
-        fprintf(stderr, "invalid tilesize argument\n");
-        return -1;
-    }
-
-    for (int i=0; i<(int)tilesize.size(); i++)
-    {
-        if (tilesize[i] != 0 && tilesize[i] < 32)
-        {
-            fprintf(stderr, "invalid tilesize argument\n");
-            return -1;
-        }
-    }
-
     if (jobs_load < 1 || jobs_save < 1)
     {
         fprintf(stderr, "invalid thread count argument\n");
         return -1;
-    }
-
-    if (jobs_proc.size() != (gpuid.empty() ? 1 : gpuid.size()) && !jobs_proc.empty())
-    {
-        fprintf(stderr, "invalid jobs_proc thread count argument\n");
-        return -1;
-    }
-
-    for (int i=0; i<(int)jobs_proc.size(); i++)
-    {
-        if (jobs_proc[i] < 1)
-        {
-            fprintf(stderr, "invalid jobs_proc thread count argument\n");
-            return -1;
-        }
     }
 
     if (!path_is_directory(outputpath))
@@ -789,120 +735,23 @@ int main(int argc, char** argv)
 #if _WIN32
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 #endif
-
-    ncnn::create_gpu_instance();
-
-    if (gpuid.empty())
-    {
-        gpuid.push_back(ncnn::get_default_gpu_index());
-    }
-
-    const int use_gpu_count = (int)gpuid.size();
-
-    if (jobs_proc.empty())
-    {
-        jobs_proc.resize(use_gpu_count, 2);
-    }
-
-    if (tilesize.empty())
-    {
-        tilesize.resize(use_gpu_count, 0);
-    }
-
     int cpu_count = std::max(1, ncnn::get_cpu_count());
     jobs_load = std::min(jobs_load, cpu_count);
     jobs_save = std::min(jobs_save, cpu_count);
 
-    int gpu_count = ncnn::get_gpu_count();
-    for (int i=0; i<use_gpu_count; i++)
-    {
-        if (gpuid[i] < -1 || gpuid[i] >= gpu_count)
-        {
-            fprintf(stderr, "invalid gpu device\n");
-
-            ncnn::destroy_gpu_instance();
-            return -1;
-        }
-    }
-
-    int total_jobs_proc = 0;
-    int jobs_proc_per_gpu[16] = {0};
-    for (int i=0; i<use_gpu_count; i++)
-    {
-        if (gpuid[i] == -1)
-        {
-            jobs_proc[i] = std::min(jobs_proc[i], cpu_count);
-            total_jobs_proc += 1;
-        }
-        else
-        {
-            total_jobs_proc += jobs_proc[i];
-            jobs_proc_per_gpu[gpuid[i]] += jobs_proc[i];
-        }
-    }
-
-    for (int i=0; i<use_gpu_count; i++)
-    {
-        if (tilesize[i] != 0)
-            continue;
-
-        if (gpuid[i] == -1)
-        {
-            // cpu only
-            tilesize[i] = 400;
-            continue;
-        }
-
-        uint32_t heap_budget = ncnn::get_gpu_device(gpuid[i])->get_heap_budget();
-
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
-        {
-            // multiple gpu jobs share the same heap
-            heap_budget /= jobs_proc_per_gpu[gpuid[i]];
-        }
-
-        // more fine-grained tilesize policy here
-        if (model.find(PATHSTR("models-cunet")) != path_t::npos)
-        {
-            if (heap_budget > 2600)
-                tilesize[i] = 400;
-            else if (heap_budget > 740)
-                tilesize[i] = 200;
-            else if (heap_budget > 250)
-                tilesize[i] = 100;
-            else
-                tilesize[i] = 32;
-        }
-        else if (model.find(PATHSTR("models-upconv_7_anime_style_art_rgb")) != path_t::npos
-            || model.find(PATHSTR("models-upconv_7_photo")) != path_t::npos)
-        {
-            if (heap_budget > 1900)
-                tilesize[i] = 400;
-            else if (heap_budget > 550)
-                tilesize[i] = 200;
-            else if (heap_budget > 190)
-                tilesize[i] = 100;
-            else
-                tilesize[i] = 32;
-        }
-    }
+    int total_jobs_proc = 1;
 
     {
-        std::vector<Waifu2x*> waifu2x(use_gpu_count);
+        Waifu2x* waifu2x;
 
-        for (int i=0; i<use_gpu_count; i++)
-        {
-            int num_threads = gpuid[i] == -1 ? jobs_proc[i] : 1;
+        waifu2x = new Waifu2x(-1, tta_mode, cpu_count);
 
-            waifu2x[i] = new Waifu2x(gpuid[i], tta_mode, num_threads);
-
-            waifu2x[i]->load(paramfullpath, modelfullpath);
-
-            waifu2x[i]->noise = noise;
-            waifu2x[i]->scale = (scale >= 2) ? 2 : scale;
-            waifu2x[i]->tilesize = tilesize[i];
-            waifu2x[i]->prepadding = prepadding;
-        }
+        waifu2x->load(paramfullpath, modelfullpath);
+        waifu2x->noise = noise;
+        waifu2x->scale = (scale >= 2) ? 2 : scale;
+        waifu2x->tilesize = 400;
+        waifu2x->prepadding = prepadding;
+        
 
         // main routine
         {
@@ -916,29 +765,12 @@ int main(int argc, char** argv)
             ncnn::Thread load_thread(load, (void*)&ltp);
 
             // waifu2x proc
-            std::vector<ProcThreadParams> ptp(use_gpu_count);
-            for (int i=0; i<use_gpu_count; i++)
-            {
-                ptp[i].waifu2x = waifu2x[i];
-            }
+            ProcThreadParams ptp;
+            ptp.waifu2x = waifu2x;
 
-            std::vector<ncnn::Thread*> proc_threads(total_jobs_proc);
+            ncnn::Thread* proc_thread;
             {
-                int total_jobs_proc_id = 0;
-                for (int i=0; i<use_gpu_count; i++)
-                {
-                    if (gpuid[i] == -1)
-                    {
-                        proc_threads[total_jobs_proc_id++] = new ncnn::Thread(proc, (void*)&ptp[i]);
-                    }
-                    else
-                    {
-                        for (int j=0; j<jobs_proc[i]; j++)
-                        {
-                            proc_threads[total_jobs_proc_id++] = new ncnn::Thread(proc, (void*)&ptp[i]);
-                        }
-                    }
-                }
+                proc_thread = new ncnn::Thread(proc, (void*)&ptp);
             }
 
             // save image
@@ -962,11 +794,8 @@ int main(int argc, char** argv)
                 toproc.put(end);
             }
 
-            for (int i=0; i<total_jobs_proc; i++)
-            {
-                proc_threads[i]->join();
-                delete proc_threads[i];
-            }
+            proc_thread->join();
+            delete proc_thread;
 
             for (int i=0; i<jobs_save; i++)
             {
@@ -980,14 +809,8 @@ int main(int argc, char** argv)
             }
         }
 
-        for (int i=0; i<use_gpu_count; i++)
-        {
-            delete waifu2x[i];
-        }
-        waifu2x.clear();
+        delete waifu2x;
     }
-
-    ncnn::destroy_gpu_instance();
 
     return 0;
 }
