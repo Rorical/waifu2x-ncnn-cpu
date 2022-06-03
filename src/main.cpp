@@ -328,7 +328,7 @@ void* proc(void* args)
         if (scale == 1)
         {
             v.outimage = ncnn::Mat(v.inimage.w, v.inimage.h, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
-            waifu2x->process(v.inimage, v.outimage);
+            waifu2x->process_cpu(v.inimage, v.outimage);
 
             tosave.put(v);
             continue;
@@ -357,13 +357,13 @@ void* proc(void* args)
         }
 
         v.outimage = ncnn::Mat(v.inimage.w * 2, v.inimage.h * 2, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
-        waifu2x->process(v.inimage, v.outimage);
+        waifu2x->process_cpu(v.inimage, v.outimage);
 
         for (int i = 1; i < scale_run_count; i++)
         {
             ncnn::Mat tmp = v.outimage;
             v.outimage = ncnn::Mat(tmp.w * 2, tmp.h * 2, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
-            waifu2x->process(tmp, v.outimage);
+            waifu2x->process_cpu(tmp, v.outimage);
         }
 
         tosave.put(v);
@@ -795,7 +795,6 @@ int main(int argc, char** argv)
             }
 
             proc_thread->join();
-            delete proc_thread;
 
             for (int i=0; i<jobs_save; i++)
             {
@@ -807,6 +806,8 @@ int main(int argc, char** argv)
                 save_threads[i]->join();
                 delete save_threads[i];
             }
+
+            delete proc_thread;
         }
 
         delete waifu2x;
